@@ -63,13 +63,19 @@ export function createDemoServer({dbPath=path.join(DEFAULT_DATA,'demo.sqlite'),q
     const requestId=id();securityHeaders(res,requestId);
     try {
       const port=req.socket.localPort;
-      const allowedHosts=[`localhost:${port}`,`127.0.0.1:${port}`];
-      if(!allowedHosts.includes(req.headers.host))fail(403,'INVALID_HOST','This demo is available only through localhost.');
+      // On hosted platforms (e.g. Render) the Host header is the public domain — skip localhost-only check
+      const isLocalRequest=!process.env.PORT;  // DEMO_PORT=local, PORT=hosted
+      if(isLocalRequest){
+        const allowedHosts=[`localhost:${port}`,`127.0.0.1:${port}`];
+        if(!allowedHosts.includes(req.headers.host))fail(403,'INVALID_HOST','This demo is available only through localhost.');
+      }
       const origin=req.headers.origin;
       // Allow the Next.js frontend (localhost:3000/3003) in addition to the vanilla frontend
-      const allowedOrigins=[...allowedHosts.map(h=>'http://'+h),'http://localhost:3000','http://127.0.0.1:3000','http://localhost:3003','http://127.0.0.1:3003'];
-      if(origin&&!allowedOrigins.includes(origin))fail(403,'INVALID_ORIGIN','Cross-origin requests are disabled.');
-      if(origin&&allowedOrigins.includes(origin)){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Access-Control-Allow-Credentials','true');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type,Authorization,Idempotency-Key,X-Filename');}
+      const localhostOrigins=[`http://localhost:${port}`,`http://127.0.0.1:${port}`,'http://localhost:3000','http://127.0.0.1:3000','http://localhost:3003','http://127.0.0.1:3003'];
+      // On hosted platforms allow any origin (Render proxy sets origin to public URL)
+      const originAllowed=!origin||!isLocalRequest||localhostOrigins.includes(origin);
+      if(!originAllowed)fail(403,'INVALID_ORIGIN','Cross-origin requests are disabled.');
+      if(origin){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Access-Control-Allow-Credentials','true');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');res.setHeader('Access-Control-Allow-Headers','Content-Type,Authorization,Idempotency-Key,X-Filename');}
       const url=new URL(req.url,`http://${req.headers.host}`);const route=url.pathname;const method=req.method;
       // CORS preflight
       if(method==='OPTIONS'){res.writeHead(204);res.end();return;}
@@ -269,15 +275,18 @@ export function createDemoServer({dbPath=path.join(DEFAULT_DATA,'demo.sqlite'),q
 const isDirect=process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url);
 if(isDirect) {
   // NODE_ENV guard removed — demo server is allowed to run on hosted platforms (e.g. Render)
-  const port=Number(process.env.DEMO_PORT??5050);
-  if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('DEMO_PORT must be between 1024 and 65535.');
+  // Render injects PORT; fall back to DEMO_PORT for local use
+  const port=Number(process.env.PORT??process.env.DEMO_PORT??5050);
+  if(!Number.isInteger(port)||port<1||port>65535)throw new Error('PORT must be a valid port number.');
   const dataDir=path.resolve(process.env.DEMO_DATA_DIR??DEFAULT_DATA);
   const releaseLock=acquireRuntimeLock(dataDir);
   process.on('exit',releaseLock);
   const {server}=createDemoServer({dbPath:path.join(dataDir,'demo.sqlite')});
   server.on('close',releaseLock);
   server.on('error',error=>{releaseLock();console.error(error.code==='EADDRINUSE'?`Port ${port} is already in use. Stop the other server or set DEMO_PORT.`:error.message);process.exitCode=1;});
-  server.listen(port,'127.0.0.1',()=>{
+  // Bind to 0.0.0.0 so Render (and other hosts) can reach the server
+  const host=process.env.PORT?'0.0.0.0':'127.0.0.1';
+  server.listen(port,host,()=>{
     console.log(`\nCarbonSynq University Demo\nOpen http://localhost:${port}\nDemo data: ${process.env.DEMO_DATA_DIR??DEFAULT_DATA}\nLogin: admin@carbonsynq.demo / Demo@12345\nLocal demo only. Synthetic data and illustrative factors. Press Ctrl+C to stop.\n`);
   });
   let stopping=false;
