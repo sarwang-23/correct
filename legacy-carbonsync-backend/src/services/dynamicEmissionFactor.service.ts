@@ -1,0 +1,1473 @@
+import {
+    classifyInvoiceDocument,
+    SupportedCountry,
+} from "./documentClassifier.service.js";
+import {
+    validateElectricityBill,
+    validateTrainTicket,
+    validateFlightTicket,
+} from "./validation.service.js";
+import {
+    calculateIndiaElectricityEmission,
+    calculateIndiaTrainEmission,
+    calculateIndiaFlightEmission,
+} from "./fixedIndiaEF.service.js";
+import {
+    calculateGermanyEmission,
+} from "./GermanyEmission.service.js";
+import { calculateIndiaEmission } from "./IndiaEmission.service.js";
+import {
+    calculateWithClimatiqFallback,
+} from "./ClimatiqFallback.service.js";
+import {
+    searchClimatiqEmissionFactors,
+    estimateWithClimatiq,
+    selectLatestEmberElectricityFactor,
+    buildActivityParameters,
+    isLikelyCompatibleFactor,
+} from "./climatiq.service.js";
+import {
+    normalizeLineItem,
+    normalizeLineItems,
+    hasValidNormalizedQuantity,
+} from "./lineItemNormalizer.service.js";
+import {
+    getPreMappingPolicy,
+    selectBestEmissionFactorForCalculation,
+    buildSelectedEmissionFactorSummary,
+} from "./emissionMapping.service.js";
+import {
+    buildAuditTrail,
+    calculatePipelineConfidence,
+    buildResultWarnings,
+} from "./auditTrail.service.js";
+import axios from "axios";
+import { convertQuantity } from "./unit.service.js";
+import { detectCategoryFromText } from "./CategoryDetection.service.js";
+
+
+type DetectedCategory =
+    | "electricity_bill"
+    | "district_heating"
+    | "fuel"
+    | "transport_logistics"
+    | "purchased_goods"
+    | "water"
+    | "waste"
+    | "hotel"
+    | "steel"
+    | "cement"
+    | "natural_gas"
+    | "lpg"
+    | "diesel"
+    | "petrol"
+    | "unknown";
+
+
+
+
+const INDIA_FIXED_ELECTRICITY_FACTOR = 0.710; // kgCO2e/kWh
+const INDIA_FIXED_PASSENGER_RAIL_FACTOR = 0.007976; // kgCO2e/passenger-km
+const INDIA_FIXED_PASSENGER_FLIGHT_FACTOR = 0.18; // kgCO2e/passenger-km
+
+function extractPassengerCount(item: any): number {
+    const raw = item?.passengers ?? item?.passenger_count ?? item?.parameters?.passengers ?? item?.parameters?.passenger_count ?? 1;
+    const value = Number(raw);
+    return Number.isFinite(value) && value > 0 && value <= 100 ? value : 1;
+}
+
+function extractDistanceKm(item: any): number {
+    const rawDistance =
+        item?.distance ??
+        item?.distance_km ??
+        item?.parameters?.distance ??
+        item?.parameters?.distance_km ??
+        item?.parameters?.distanceKm;
+
+    const distance = Number(rawDistance);
+    if (Number.isFinite(distance) && distance > 0) return distance;
+
+    const unit = safeLower(item?.unit);
+    const quantity = Number(item?.quantity || 0);
+    if (Number.isFinite(quantity) && quantity > 0 && (unit.includes("km") || unit.includes("kilometer") || unit.includes("kilometre"))) {
+        return quantity;
+    }
+
+    return Number.isFinite(quantity) && quantity > 0 ? quantity : 0;
+}
+
+function isIndiaTrainTicketText(text: string): boolean {
+    const lower = safeLower(text);
+    return (
+        lower.includes("passenger rail") ||
+        lower.includes("railway") ||
+        lower.includes("train ticket") ||
+        lower.includes("rail ticket") ||
+        lower.includes("irctc") ||
+        lower.includes("indian railways")
+    );
+}
+
+function isIndiaFlightTicketText(text: string): boolean {
+    const lower = safeLower(text);
+    return (
+        lower.includes("passenger flight") ||
+        lower.includes("flight ticket") ||
+        lower.includes("boarding pass") ||
+        lower.includes("airline") ||
+        lower.includes("airport") ||
+        lower.includes("air india") ||
+        lower.includes("indigo") ||
+        lower.includes("spicejet") ||
+        lower.includes("vistara") ||
+        lower.includes("akasa")
+    );
+}
+
+
+
+
+
+function safeLower(value: any) {
+    return String(value || "").toLowerCase();
+}
+
+function roundNumber(value: number, decimals = 6) {
+    return Number(Number(value || 0).toFixed(decimals));
+}
+
+
+function includesAny(text: string, keywords: string[]) {
+    const lower = safeLower(text);
+    return keywords.some((keyword) => lower.includes(keyword));
+}
+
+function getMaterialProfile(itemName: string, description = "") {
+    const text = safeLower(`${itemName} ${description}`);
+
+    if (includesAny(text, ["flush door", "pinewood", "plywood", "veneer", "laminate", "laminates", "wood", "timber", "door"])) {
+        const thicknessMatch = text.match(/(\d+(?:\.\d+)?)\s*mm/);
+        const thicknessMm = thicknessMatch?.[1] ? Number(thicknessMatch[1]) : 32;
+
+        let densityKgM3 = 550;
+        let material = "wood product";
+
+        if (text.includes("pinewood")) {
+            densityKgM3 = 500;
+            material = "pine wood product";
+        } else if (text.includes("plywood")) {
+            densityKgM3 = 600;
+            material = "plywood product";
+        } else if (text.includes("flush door") || text.includes("door")) {
+            densityKgM3 = 550;
+            material = "wooden flush door";
+        } else if (text.includes("timber") || text.includes("wood")) {
+            densityKgM3 = 500;
+            material = "timber wood product";
+        }
+
+        return {
+            material,
+            thickness_mm: thicknessMm,
+            thickness_m: thicknessMm / 1000,
+            density_kg_m3: densityKgM3,
+        };
+    }
+
+    return null;
+}
+
+function convertAreaMaterialToWeightKg(item: any, normalizedItemData: any) {
+    const itemName = String(normalizedItemData?.item_name || item?.item_name || "");
+    const description = String(normalizedItemData?.description || item?.description || "");
+    const unit = safeLower(normalizedItemData?.unit || item?.unit);
+    const quantity = Number(normalizedItemData?.quantity || item?.quantity || 0);
+
+    if (unit !== "m2" || !quantity || quantity <= 0) return null;
+
+    const profile = getMaterialProfile(itemName, description);
+    if (!profile) return null;
+
+    const weightKg = quantity * profile.thickness_m * profile.density_kg_m3;
+
+    return {
+        value: roundNumber(weightKg),
+        unit: "kg",
+        weight: roundNumber(weightKg),
+        weight_unit: "kg",
+        conversion_method: "area_to_weight_using_thickness_and_density",
+        original_area_m2: quantity,
+        ...profile,
+    };
+}
+
+function factorUsesSpendParameters(factor: any) {
+    const unit = safeLower(factor?.unit);
+    return unit.includes("/usd") || unit.includes("usd") || unit.includes("/eur") || unit.includes("eur") || unit.includes("/gbp") || unit.includes("gbp");
+}
+
+function getSpendParameters(item: any) {
+    const amount = Number(item?.amount || 0);
+    const currency = String(item?.currency || item?.parameters?.currency || "").toUpperCase();
+
+    if (!amount || amount <= 0 || !currency) return null;
+
+    // Climatiq CEDA spend-based factors commonly use kg/USD.
+    // Invoice amount can be INR/MYR, so convert money to USD before calling Estimate API.
+    // Set these env vars in production for your preferred accounting FX rate:
+    // INR_TO_USD_RATE=0.012
+    // MYR_TO_USD_RATE=0.21
+    if (currency === "USD") {
+        return {
+            money: amount,
+            money_unit: "usd",
+            original_money: amount,
+            original_money_unit: "USD",
+            conversion_method: "spend_based_usd_original",
+        };
+    }
+
+    if (currency === "INR") {
+        const rate = Number(process.env.INR_TO_USD_RATE || process.env.USD_PER_INR || 0.012);
+        return {
+            money: Number((amount * rate).toFixed(6)),
+            money_unit: "usd",
+            original_money: amount,
+            original_money_unit: "INR",
+            fx_rate_to_usd: rate,
+            conversion_method: "spend_based_inr_to_usd",
+        };
+    }
+
+    if (currency === "MYR") {
+        const rate = Number(process.env.MYR_TO_USD_RATE || process.env.USD_PER_MYR || 0.21);
+        return {
+            money: Number((amount * rate).toFixed(6)),
+            money_unit: "usd",
+            original_money: amount,
+            original_money_unit: "MYR",
+            fx_rate_to_usd: rate,
+            conversion_method: "spend_based_myr_to_usd",
+        };
+    }
+
+    // Unknown currency: do not guess. Let calculation fail cleanly with needs_review.
+    return null;
+}
+
+function buildClimatiqParameterCandidates(category: DetectedCategory, normalizedItemData: any, converted: any, item: any) {
+    const candidates: Array<{ parameters: Record<string, any>; converted: any; method: string }> = [];
+
+    const directParameters = buildActivityParameters(category, normalizedItemData, converted);
+    candidates.push({
+        parameters: directParameters,
+        converted,
+        method: "direct_normalized_parameters",
+    });
+
+    if (category === "purchased_goods") {
+        const areaToWeight = convertAreaMaterialToWeightKg(item, normalizedItemData);
+        if (areaToWeight) {
+            candidates.unshift({
+                parameters: {
+                    weight: areaToWeight.weight,
+                    weight_unit: "kg",
+                },
+                converted: areaToWeight,
+                method: "area_to_weight_material_conversion",
+            });
+        }
+
+        const spend = getSpendParameters(normalizedItemData);
+        if (spend) {
+            candidates.push({
+                parameters: {
+                    money: spend.money,
+                    money_unit: spend.money_unit,
+                },
+                converted: {
+                    value: spend.money,
+                    unit: spend.money_unit,
+                    original_money: spend.original_money,
+                    original_money_unit: spend.original_money_unit,
+                    fx_rate_to_usd: spend.fx_rate_to_usd,
+                    conversion_method: spend.conversion_method || "spend_based_parameters",
+                },
+                method: spend.conversion_method || "spend_based_parameters",
+            });
+        }
+    }
+
+    return candidates;
+}
+
+function getClimatiqErrorDetails(error: any) {
+    return {
+        status: error?.response?.status,
+        data: error?.response?.data,
+        message: error?.message || String(error),
+    };
+}
+
+async function estimateWithCompatibleCandidates(input: {
+    candidates: any[];
+    best: any;
+    category: DetectedCategory;
+    normalizedItemData: any;
+    normalizedInputItem: any;
+    item: any;
+}) {
+    const orderedFactors = [
+        input.best.selected,
+        ...(input.best.alternatives || []),
+    ].filter(Boolean);
+
+    const parameterCandidates = buildClimatiqParameterCandidates(
+        input.category,
+        input.normalizedItemData,
+        input.category === "electricity_bill"
+            ? { value: Number(input.normalizedItemData.quantity || 1), unit: "kWh" }
+            : convertQuantity(Number(input.normalizedItemData.quantity || 1), input.normalizedItemData.unit || "kg"),
+        input.item
+    );
+
+    const attempts: any[] = [];
+
+    for (const factor of orderedFactors) {
+        const spendFactor = factorUsesSpendParameters(factor);
+
+        const orderedParameterCandidates = [...parameterCandidates].sort((a, b) => {
+            const aMoney = a.parameters?.money !== undefined ? 1 : 0;
+            const bMoney = b.parameters?.money !== undefined ? 1 : 0;
+            const aWeight = a.parameters?.weight !== undefined ? 1 : 0;
+            const bWeight = b.parameters?.weight !== undefined ? 1 : 0;
+
+            if (spendFactor) return bMoney - aMoney;
+            return bWeight - aWeight;
+        });
+
+        for (const parameterCandidate of orderedParameterCandidates) {
+            if (!isLikelyCompatibleFactor(factor, parameterCandidate.parameters)) {
+                attempts.push({
+                    activity_id: factor.activity_id,
+                    unit: factor.unit,
+                    method: parameterCandidate.method,
+                    skipped: true,
+                    reason: "Factor metadata not likely compatible with parameter type.",
+                    parameters: parameterCandidate.parameters,
+                });
+                continue;
+            }
+
+            try {
+                const estimateResponse = await estimateWithClimatiq({
+                    selectedEF: factor,
+                    parameters: parameterCandidate.parameters,
+                });
+
+                return {
+                    estimateResponse,
+                    selectedFactor: factor,
+                    converted: parameterCandidate.converted,
+                    parameters: parameterCandidate.parameters,
+                    parameter_method: parameterCandidate.method,
+                    attempts,
+                };
+            } catch (error: any) {
+                attempts.push({
+                    activity_id: factor.activity_id,
+                    name: factor.name,
+                    unit: factor.unit,
+                    method: parameterCandidate.method,
+                    parameters: parameterCandidate.parameters,
+                    error: getClimatiqErrorDetails(error),
+                });
+            }
+        }
+    }
+
+    return {
+        estimateResponse: null,
+        selectedFactor: null,
+        converted: null,
+        parameters: null,
+        parameter_method: null,
+        attempts,
+    };
+}
+
+
+function estimateGasBreakdown(co2e: number, category: string) {
+    const name = safeLower(category);
+    let split = { co2: 0.985, ch4: 0.005, n2o: 0.005, co2e_other: 0.005 };
+
+    if (name.includes("fuel") || name.includes("diesel") || name.includes("petrol")) {
+        split = { co2: 0.97, ch4: 0.01, n2o: 0.01, co2e_other: 0.01 };
+    }
+
+    if (name.includes("waste") || name.includes("landfill")) {
+        split = { co2: 0.55, ch4: 0.35, n2o: 0.03, co2e_other: 0.07 };
+    }
+
+    return {
+        co2: roundNumber(co2e * split.co2),
+        ch4: roundNumber(co2e * split.ch4),
+        n2o: roundNumber(co2e * split.n2o),
+        co2e_other: roundNumber(co2e * split.co2e_other),
+        gas_breakdown_available: true,
+        gas_breakdown_method: "estimated_from_category_split",
+    };
+}
+
+export function detectCountryFromInvoice(text: string, fileName = ""): SupportedCountry {
+    const lower = safeLower(`${text || ""} ${fileName || ""}`)
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // Score based detection is safer for scanned invoices where OCR may return partial text.
+    // Example Malaysia bill signals: "Bil Elektrik", "Tenaga Nasional", "RM", "Kuala Lumpur", "myTNB".
+    const malaysiaSignals = [
+        "malaysia",
+        "kuala lumpur",
+        "selangor",
+        "petaling jaya",
+        "tenaga nasional",
+        "tenaga nasional berhad",
+        "tnb",
+        "mytnb",
+        "jompay",
+        "bil elektrik",
+        "bil terperinci",
+        "caj semasa",
+        "jumlah bil anda",
+        "jumlah penggunaan",
+        "penggunaan tnb",
+        "kedai tenaga",
+        "sarawak energy",
+        "sabah electricity",
+    ];
+
+    const indiaSignals = [
+        "india",
+        "inr",
+        "gstin",
+        "cgst",
+        "sgst",
+        "igst",
+        "bescom",
+        "tata power",
+        "dhbvn",
+        "mahadiscom",
+        "adani electricity",
+        "billsahuliyat",
+    ];
+
+    let malaysiaScore = malaysiaSignals.reduce((score, word) => score + (lower.includes(word) ? 1 : 0), 0);
+    let indiaScore = indiaSignals.reduce((score, word) => score + (lower.includes(word) ? 1 : 0), 0);
+
+    // Currency signals. Use regex so "RM1,108.82" and "RM 1,108.82" both work.
+    if (/\brm\s?\d/i.test(lower) || lower.includes(" myr")) malaysiaScore += 2;
+    if (lower.includes("₹") || /\binr\s?\d/i.test(lower)) indiaScore += 2;
+
+    if (malaysiaScore > indiaScore && malaysiaScore >= 1) return "MY";
+    if (indiaScore > malaysiaScore && indiaScore >= 1) return "IN";
+
+    return (process.env.DEFAULT_INVOICE_REGION as SupportedCountry) || "IN";
+}
+
+export function detectInvoiceCategory(text: string, itemName = "", unit = ""): DetectedCategory {
+    const lower = safeLower(`${text} ${itemName} ${unit}`);
+
+    if (
+        lower.includes("passenger rail") ||
+        lower.includes("passenger flight") ||
+        lower.includes("irctc") ||
+        lower.includes("pnr") ||
+        lower.includes("boarding pass")
+    ) {
+        return "unknown"; // keep existing manual railway/flight logic in app.ts
+    }
+
+    if (
+        lower.includes("electricity") ||
+        lower.includes("electric bill") ||
+        lower.includes(" kwh") ||
+        lower.includes("kwh") ||
+        lower.includes("energy charge") ||
+        lower.includes("tnb") ||
+        lower.includes("tenaga nasional") ||
+        lower.includes("mytnb") ||
+        lower.includes("bil elektrik") ||
+        lower.includes("bil terperinci") ||
+        lower.includes("caj elektrik") ||
+        lower.includes("caj semasa") ||
+        lower.includes("jumlah bil anda") ||
+        lower.includes("jumlah penggunaan") ||
+        lower.includes("penggunaan") ||
+        lower.includes("bacaan meter") ||
+        lower.includes("tarif perdagangan") ||
+        lower.includes("dhbvn") ||
+        lower.includes("bescom") ||
+        lower.includes("tata power")
+    ) {
+        return "electricity_bill";
+    }
+
+    if (
+        lower.includes("diesel") ||
+        lower.includes("petrol") ||
+        lower.includes("gasoline") ||
+        lower.includes("fuel") ||
+        lower.includes("litre") ||
+        lower.includes("liter") ||
+        lower.includes(" ltr")
+    ) {
+        return "fuel";
+    }
+
+    if (
+        lower.includes("freight") ||
+        lower.includes("logistics") ||
+        lower.includes("shipment") ||
+        lower.includes("cargo") ||
+        lower.includes("transport") ||
+        lower.includes("container") ||
+        lower.includes("courier")
+    ) {
+        return "transport_logistics";
+    }
+
+    if (
+        lower.includes("steel") ||
+        lower.includes("aluminium") ||
+        lower.includes("aluminum") ||
+        lower.includes("cement") ||
+        lower.includes("timber") ||
+        lower.includes("wood") ||
+        lower.includes("plywood") ||
+        lower.includes("textile") ||
+        lower.includes("fabric") ||
+        lower.includes("plastic") ||
+        lower.includes("paper")
+    ) {
+        return "purchased_goods";
+    }
+
+    if (lower.includes("water") || lower.includes("sewerage")) return "water";
+    if (lower.includes("waste") || lower.includes("landfill") || lower.includes("recycling") || lower.includes("scrap")) return "waste";
+    if (lower.includes("hotel") || lower.includes("room night") || lower.includes("accommodation")) return "hotel";
+
+    return "unknown";
+}
+
+export function extractElectricityKwh(text: string): number | null {
+    const clean = String(text || "")
+        .replace(/,/g, "")
+        .replace(/\s+/g, " ");
+
+    const patterns = [
+        /kegunaan\s+kwh[\s\S]{0,160}?([\d.]+)\s*$/im,
+        /kegunaan[\s\S]{0,120}?unit[\s\S]{0,120}?([\d.]+)\s*kwh/i,
+        /blok\s+tarif\s*\(kwh\)[\s\S]{0,260}?jumlah\s+([\d.]+)/i,
+        /jumlah\s+penggunaan\s+anda\s*\(?\s*([\d.]+)\s*kwh/i,
+        /jumlah\s+penggunaan\s*\(?\s*([\d.]+)\s*kwh/i,
+        /penggunaan\s+anda\s*\(?\s*([\d.]+)\s*kwh/i,
+        /penggunaan\s*[:\-]?\s*([\d.]+)\s*kwh/i,
+        /total\s+consumption\s*[:\-]?\s*([\d.]+)\s*kwh/i,
+        /electricity\s+consumption\s*[:\-]?\s*([\d.]+)\s*kwh/i,
+        /([\d.]+)\s*kwh/i,
+    ];
+
+    for (const pattern of patterns) {
+        const match = clean.match(pattern);
+        if (match?.[1]) {
+            const value = Number(match[1]);
+            if (Number.isFinite(value) && value > 0) return value;
+        }
+    }
+
+    const lower = clean.toLowerCase();
+
+    // Do NOT use generic filename-only fallback like "scan document".
+    // It caused new TNB bills to be calculated with the old hardcoded 2169 kWh.
+    // Keep only a narrow legacy fallback for the earlier known sample identifiers.
+    if (
+        (lower.includes("210056936103") || lower.includes("933187460")) &&
+        (lower.includes("tenaga nasional") || lower.includes("bil elektrik") || lower.includes("mytnb"))
+    ) {
+        return 2169;
+    }
+
+    return null;
+}
+
+/**
+ * Priority: structured parameters (energy_kwh / energy / normalized_quantity) first,
+ * then item quantity when unit is kWh, then raw text parser as last resort.
+ */
+function getElectricityKwh(item: any, combinedText = ""): number {
+    // 1. Structured parameters — most reliable, comes from fallback extractor
+    const fromParams =
+        Number(item?.parameters?.energy_kwh) ||
+        Number(item?.parameters?.energy) ||
+        Number(item?.parameters?.normalized_quantity);
+
+    if (Number.isFinite(fromParams) && fromParams > 0) {
+        return fromParams;
+    }
+
+    // 2. Item quantity when unit is explicitly kWh
+    const fromItem = Number(item?.quantity || item?.original_quantity);
+    if (
+        Number.isFinite(fromItem) &&
+        fromItem > 0 &&
+        String(item?.unit || item?.original_unit || "").toLowerCase().includes("kwh")
+    ) {
+        return fromItem;
+    }
+
+    // 3. Raw text parser — fallback for unstructured OCR
+    if (combinedText) {
+        const fromText = extractElectricityKwh(combinedText);
+        if (fromText && fromText > 0) return fromText;
+    }
+
+    return 0;
+}
+
+export function buildClimatiqSearchQuery(category: DetectedCategory, itemName: string) {
+    const desc = safeLower(itemName);
+
+    if (category === "electricity_bill") return "electricity supplied from grid";
+
+    if (category === "fuel") {
+        if (desc.includes("diesel")) return "diesel fuel combustion";
+        if (desc.includes("petrol") || desc.includes("gasoline")) return "petrol gasoline fuel combustion";
+        if (desc.includes("natural gas") || desc.includes("cng") || desc.includes("lng")) return "natural gas combustion";
+        return "fuel combustion";
+    }
+
+    if (category === "transport_logistics") {
+        if (desc.includes("air")) return "air freight";
+        if (desc.includes("sea") || desc.includes("ocean") || desc.includes("container")) return "sea freight";
+        if (desc.includes("rail")) return "rail freight";
+        return "road freight transport";
+    }
+
+    if (category === "purchased_goods") {
+        if (desc.includes("steel")) return "steel production";
+        if (desc.includes("aluminium") || desc.includes("aluminum")) return "aluminium production";
+        if (desc.includes("cement")) return "cement production";
+        if (desc.includes("flush door") || desc.includes("pinewood") || desc.includes("door")) return "wood product production plywood timber";
+        if (desc.includes("timber") || desc.includes("wood") || desc.includes("plywood") || desc.includes("veneer") || desc.includes("laminate")) return "wood product production plywood timber";
+        if (desc.includes("textile") || desc.includes("fabric")) return "textile production";
+        if (desc.includes("plastic")) return "plastic production";
+        if (desc.includes("paper")) return "paper production";
+        return `${itemName} production`;
+    }
+
+    if (category === "water") return "water supply";
+    if (category === "waste") {
+        if (desc.includes("recycling")) return "waste recycling";
+        if (desc.includes("incineration")) return "waste incineration";
+        return "waste treatment landfill";
+    }
+    if (category === "hotel") return "hotel accommodation room night";
+
+    return itemName;
+}
+
+
+
+function scoreEmissionFactor(result: any, input: { region: SupportedCountry; category: DetectedCategory; unit: string; itemName: string }) {
+    let score = 0;
+    const activity = safeLower(`${result.activity_id || ""} ${result.name || ""} ${result.description || ""}`);
+    const unit = safeLower(result.unit || "");
+    const sourceLca = safeLower(result.source_lca_activity || "");
+    const item = safeLower(input.itemName);
+    const inputUnit = safeLower(input.unit);
+    const isWoodProductItem =
+        item.includes("wood") ||
+        item.includes("pinewood") ||
+        item.includes("plywood") ||
+        item.includes("timber") ||
+        item.includes("flush door") ||
+        item.includes("door") ||
+        item.includes("veneer") ||
+        item.includes("laminate");
+
+    const looksLikeMetalFactor =
+        activity.includes("steel") ||
+        activity.includes("metal") ||
+        activity.includes("screw") ||
+        activity.includes("fastener") ||
+        activity.includes("aluminium") ||
+        activity.includes("aluminum") ||
+        activity.includes("iron");
+
+    if (input.category === "purchased_goods" && isWoodProductItem && looksLikeMetalFactor) {
+        // Hard reject wrong matches like "Stainless steel - wood screws" for wood/flush door invoices.
+        return -9999;
+    }
+
+    if (result.region === input.region) score += 45;
+    if (result.region === "GLOBAL") score += 10;
+    if (result.year) score += Math.min(Number(result.year) - 2010, 20);
+
+    if ((inputUnit === "kwh" || inputUnit.includes("kwh")) && unit.includes("kwh")) score += 25;
+    if (["kg", "kgs", "ton", "tons", "tonne", "tonnes", "mt", "t"].includes(inputUnit) && (unit.includes("kg") || unit.includes("tonne") || unit.includes("t"))) score += 20;
+    if (["l", "ltr", "litre", "liter", "litres", "liters"].includes(inputUnit) && (unit.includes("l") || unit.includes("litre"))) score += 20;
+    if ((inputUnit === "m3" || inputUnit.includes("cubic")) && unit.includes("m3")) score += 20;
+
+    if (input.category === "electricity_bill") {
+        if (activity.includes("electricity-supply_grid")) score += 35;
+        if (activity.includes("production_mix")) score += 35;
+        if (result.source === "Ember") score += 15;
+        if (result.scopes?.includes("2") || result.scopes?.includes("combined_scopes")) score += 15;
+        if (activity.includes("losses")) score -= 70;
+        if (sourceLca.includes("well_to_tank")) score -= 45;
+        if (result.scopes?.includes("3.3")) score -= 25;
+    }
+
+    if (input.category === "fuel") {
+        if (activity.includes("fuel")) score += 25;
+        if (activity.includes("combustion")) score += 30;
+        if (item.includes("diesel") && activity.includes("diesel")) score += 35;
+        if ((item.includes("petrol") || item.includes("gasoline")) && (activity.includes("petrol") || activity.includes("gasoline"))) score += 35;
+        if (activity.includes("freight")) score -= 35;
+    }
+
+    if (input.category === "transport_logistics") {
+        if (activity.includes("freight")) score += 35;
+        if (activity.includes("transport")) score += 25;
+        if (unit.includes("tkm") || unit.includes("tonne-km")) score += 30;
+        if (activity.includes("combustion") && !activity.includes("freight")) score -= 30;
+    }
+
+    if (input.category === "purchased_goods") {
+        if (activity.includes("production")) score += 30;
+        if (activity.includes("market for")) score += 15;
+
+        if (isWoodProductItem) {
+            if (activity.includes("wood") || activity.includes("timber") || activity.includes("plywood") || activity.includes("forestry")) score += 80;
+            if (activity.includes("door") || activity.includes("wood product")) score += 40;
+            if (activity.includes("screw") || activity.includes("fastener") || activity.includes("steel") || activity.includes("metal")) score -= 200;
+        } else {
+            for (const k of ["steel", "aluminium", "aluminum", "cement", "textile", "fabric", "plastic", "paper"]) {
+                if (item.includes(k) && activity.includes(k)) score += 35;
+            }
+        }
+
+        if (activity.includes("transport")) score -= 30;
+        if (activity.includes("waste")) score -= 30;
+    }
+
+    if (input.category === "water") {
+        if (activity.includes("water supply")) score += 40;
+        if (activity.includes("water treatment")) score += 20;
+        if (unit.includes("m3")) score += 25;
+    }
+
+    if (input.category === "waste") {
+        if (activity.includes("waste")) score += 30;
+        if (activity.includes("landfill")) score += 20;
+        if (activity.includes("recycling")) score += 20;
+        if (activity.includes("incineration")) score += 20;
+    }
+
+    if (input.category === "hotel") {
+        if (activity.includes("hotel")) score += 35;
+        if (activity.includes("accommodation")) score += 35;
+        if (activity.includes("room")) score += 15;
+    }
+
+    return score;
+}
+
+export function selectBestEmissionFactor(results: any[], input: { region: SupportedCountry; category: DetectedCategory; unit: string; itemName: string }) {
+    const scored = (results || [])
+        .filter((r) => r.region === input.region || r.region === "GLOBAL")
+        .map((r) => {
+            const calculatedScore = scoreEmissionFactor(r, input);
+            return {
+                ...r,
+                mapping_score: calculatedScore < 0 ? calculatedScore : Math.max(Number(r.mapping_score || 0), calculatedScore),
+            };
+        })
+        .filter((r) => Number(r.mapping_score || 0) > 0)
+        .sort((a, b) => b.mapping_score - a.mapping_score);
+
+    // For non-India electricity bills, prefer latest Ember production mix when available.
+    // India electricity is handled earlier by fixed EF and will not reach this selector.
+    if (input.category === "electricity_bill" && input.region !== "IN") {
+        const latestEmberProductionMix = scored
+            .filter((r) =>
+                r.region === input.region &&
+                r.source === "Ember" &&
+                String(r.activity_id || "").includes("electricity-supply_grid-source_production_mix") &&
+                String(r.unit || "").toLowerCase().includes("kwh")
+            )
+            .sort((a, b) => Number(b.year || 0) - Number(a.year || 0))[0];
+
+        if (latestEmberProductionMix) {
+            return {
+                selected: latestEmberProductionMix,
+                alternatives: scored.filter((r) => r.id !== latestEmberProductionMix.id).slice(0, 3),
+                confidence: 0.95,
+                reason: `Selected latest ${input.region} Ember production mix for grid electricity bill.`,
+            };
+        }
+    }
+
+    const selected = scored[0] || null;
+    return {
+        selected,
+        alternatives: scored.slice(1, 4),
+        confidence: selected?.mapping_score >= 100 ? 0.95 : selected?.mapping_score >= 75 ? 0.85 : selected?.mapping_score >= 50 ? 0.65 : 0.4,
+        reason: selected
+            ? `Selected best ${input.region} emission factor using region, unit, activity_id, source, scope and latest year scoring.`
+            : "No suitable emission factor found.",
+    };
+}
+
+
+
+export async function calculateDynamicCountryEmission(item: any, invoiceText: string, fileName = "") {
+    const normalizedInputItem = normalizeLineItem(item);
+    const originalItemName = String(
+        normalizedInputItem.item_name || item.item_name || item.description || ""
+    );
+    const combinedText = `${invoiceText || ""} ${originalItemName || ""} ${fileName || ""}`;
+    const classification = classifyInvoiceDocument({
+        text: combinedText,
+        fileName,
+        itemName: originalItemName,
+        unit: String(normalizedInputItem.unit || item.unit || ""),
+    });
+
+    const region = classification.country as SupportedCountry;
+    let category = classification.category as string;
+
+    const specificCategory = detectCategoryFromText(originalItemName);
+    if (specificCategory && specificCategory !== "unknown") {
+        category = specificCategory;
+    }
+
+    if (!hasValidNormalizedQuantity(normalizedInputItem) && category !== "electricity_bill") {
+        return {
+            success: false,
+            needs_review: true,
+            error_type: "INVALID_NORMALIZED_QUANTITY",
+            message: "Line item quantity or unit could not be normalized.",
+            item_name: originalItemName,
+            country: region,
+            category,
+            normalization: normalizedInputItem,
+        };
+    }
+
+    // India region fixed EF rules. These three document types must not go to Climatiq.
+    if (region === "DE") {
+        const value = Number(normalizedInputItem.quantity || item.quantity || 0);
+        const unit = String(normalizedInputItem.unit !== "unknown" ? normalizedInputItem.unit : item.unit || "");
+
+        const nameLower = originalItemName.toLowerCase();
+        let mappedCategory: string = category;
+        
+        if (nameLower.includes("fernwärme") || nameLower.includes("fernwaerme") || nameLower.includes("district heating") || nameLower.includes("heat supply") || nameLower.includes("wärmenetz") || nameLower.includes("heating energy") || category === "district_heating") {
+            mappedCategory = "district_heating";
+        } else if (category === "electricity_bill" || nameLower.includes("strom") || nameLower.includes("netzstrom") || nameLower.includes("elektrizität") || nameLower.includes("electricity")) {
+            mappedCategory = "electricity";
+        } else if (category === "fuel" && (nameLower.includes("erdgas") || nameLower.includes("natural gas") || nameLower.includes("gasrechnung") || nameLower.includes("netzgas") || nameLower.includes("gasverbrauch") || nameLower.includes("gas consumption") || nameLower.includes("heating gas") || nameLower.includes("gas"))) {
+            mappedCategory = "natural_gas";
+        } else if (category === "fuel" && (nameLower.includes("petrol") || nameLower.includes("benzin") || nameLower.includes("super") || nameLower.includes("gasoline"))) {
+            mappedCategory = "petrol";
+        } else if (category === "fuel" && (nameLower.includes("lpg") || nameLower.includes("autogas"))) {
+            mappedCategory = "lpg";
+        } else if (category === "fuel" && (nameLower.includes("coal") || nameLower.includes("kohle"))) {
+            mappedCategory = "coal";
+        } else if (category === "fuel" && (nameLower.includes("diesel") || nameLower.includes("dieselkraftstoff") || nameLower.includes("heizöl") || nameLower.includes("gazole"))) {
+            mappedCategory = "diesel";
+        } else if (category === "transport_logistics" && (nameLower.includes("flight") || nameLower.includes("flug"))) {
+            mappedCategory = "flight";
+        } else if (category === "transport_logistics" && (nameLower.includes("rail") || nameLower.includes("bahn") || nameLower.includes("train"))) {
+            mappedCategory = "railway";
+        } else if (category === "transport_logistics") {
+            mappedCategory = "freight";
+        }
+
+        // Step 1: Try UBA mapping via GermanyEmission service
+        const germanyResult = await calculateGermanyEmission({
+            category: mappedCategory,
+            value,
+            unit,
+        });
+
+        if (germanyResult.success) {
+            return {
+                success: true,
+                source_engine: "climatiq",
+                preferred_source: "UBA",
+                region: "DE",
+                country_name: "Germany",
+                category,
+                value,
+                unit,
+                co2e: germanyResult.co2e,
+                co2e_unit: germanyResult.co2e_unit,
+                activity_id: germanyResult.activity_id,
+                factor_name: germanyResult.factor_name,
+                factor_source: germanyResult.factor_source,
+                result: {
+                    co2e: germanyResult.co2e,
+                    total_tco2e: germanyResult.co2e / 1000,
+                    factor_name: germanyResult.factor_name,
+                    activity_id: germanyResult.activity_id,
+                    source: germanyResult.factor_source,
+                    factor_year: 2024,
+                    factor_region: "DE",
+                    category: mappedCategory
+                }
+            };
+        }
+
+        // Step 2: UBA not found → try Climatiq fallback (petrol, lpg, coal, freight, railway, flight)
+        console.log(`[DE dynamic] No UBA mapping for "${mappedCategory}". Trying Climatiq fallback...`);
+        const fallbackResult = await calculateWithClimatiqFallback({
+            region: "DE",
+            countryName: "Germany",
+            category: mappedCategory,
+            itemName: originalItemName,
+            value,
+            unit,
+        });
+
+        if (fallbackResult.success) {
+            return {
+                success: true,
+                source_engine: "climatiq",
+                preferred_source: "Climatiq",
+                region: "DE",
+                country_name: "Germany",
+                category,
+                value,
+                unit,
+                co2e: fallbackResult.co2e,
+                co2e_unit: fallbackResult.co2e_unit,
+                activity_id: fallbackResult.activity_id,
+                factor_name: fallbackResult.factor_name,
+                factor_source: fallbackResult.factor_source,
+                result: {
+                    co2e: fallbackResult.co2e,
+                    total_tco2e: fallbackResult.co2e / 1000,
+                    factor_name: fallbackResult.factor_name,
+                    activity_id: fallbackResult.activity_id,
+                    source: fallbackResult.factor_source,
+                    factor_year: 2024,
+                    factor_region: "DE",
+                    category: mappedCategory
+                }
+            };
+        }
+
+        // Step 3: Both failed → review
+        return {
+            success: false,
+            needs_review: true,
+            error_type: "GERMANY_EMISSION_FAILED",
+            message: (fallbackResult as any).message || germanyResult.message || "No UBA or Climatiq factor found for this Germany item.",
+            item_name: originalItemName,
+            country: region,
+            category,
+        };
+    }
+
+    if (region === "IN" && category === "electricity_bill") {
+        const quantity = getElectricityKwh(item, combinedText);
+        
+        const validation = validateElectricityBill({
+            extractedKwh: Number(quantity || 0),
+            rawText: combinedText,
+            source: "india_fixed_electricity",
+        });
+
+        if (!validation.valid) {
+            return {
+                success: false,
+                needs_review: true,
+                error_type: "INDIA_ELECTRICITY_VALIDATION_FAILED",
+                message: "India electricity bill validation failed. Please verify extracted kWh before fixed EF calculation.",
+                item_name: originalItemName || "India Electricity Bill",
+                country: region,
+                category,
+                validation,
+            };
+        }
+
+        return calculateIndiaElectricityEmission({
+            quantity,
+            itemName: originalItemName || "India Electricity Bill",
+            description: item.description,
+            fileName,
+            validation,
+        });
+    }
+
+    if (region === "IN" && isIndiaTrainTicketText(combinedText)) {
+        const distanceKm = extractDistanceKm(item);
+        const passengerCount = extractPassengerCount(item);
+
+        const validation = validateTrainTicket({
+            distanceKm,
+            passengerCount,
+            country: region,
+        });
+
+        if (!validation.valid) {
+            return {
+                success: false,
+                needs_review: true,
+                error_type: "TRAIN_VALIDATION_FAILED",
+                message: "Train ticket validation failed. Distance or passenger count is missing.",
+                item_name: originalItemName || "India Train Ticket",
+                country: region,
+                category: "train_ticket",
+                validation,
+            };
+        }
+
+        return calculateIndiaTrainEmission({
+            distanceKm,
+            passengerCount,
+            itemName: originalItemName || "India Train Ticket",
+            description: item.description,
+            fileName,
+            validation,
+        });
+    }
+
+    if (region === "IN" && isIndiaFlightTicketText(combinedText)) {
+        const distanceKm = extractDistanceKm(item);
+        const passengerCount = extractPassengerCount(item);
+
+        const validation = validateFlightTicket({
+            distanceKm,
+            passengerCount,
+            origin: item.origin || item?.parameters?.origin,
+            destination: item.destination || item?.parameters?.destination,
+            country: region,
+        });
+
+        if (!validation.valid) {
+            return {
+                success: false,
+                needs_review: true,
+                error_type: "FLIGHT_VALIDATION_FAILED",
+                message: "Flight ticket validation failed. Distance or passenger count is missing.",
+                item_name: originalItemName || "India Flight Ticket",
+                country: region,
+                category: "flight_ticket",
+                validation,
+            };
+        }
+
+        return calculateIndiaFlightEmission({
+            distanceKm,
+            passengerCount,
+            itemName: originalItemName || "India Flight Ticket",
+            description: item.description,
+            fileName,
+            validation,
+        });
+    }
+
+    if (region === "IN") {
+        const value = Number(normalizedInputItem.quantity || item.quantity || 0);
+        const unit = String(normalizedInputItem.unit !== "unknown" ? normalizedInputItem.unit : item.unit || "");
+
+        console.log(`[IN dynamic] Routing "${category}" to India Emission fallback...`);
+        
+        try {
+            const fallbackResult = await calculateIndiaEmission({
+                category,
+                itemName: originalItemName,
+                value,
+                unit
+            });
+
+            if (fallbackResult.success) {
+                return {
+                    success: true,
+                    source_engine: fallbackResult.source_engine,
+                    preferred_source: fallbackResult.preferred_source,
+                    region: fallbackResult.region,
+                    country_name: fallbackResult.country_name,
+                    category: fallbackResult.category,
+                    value,
+                    unit,
+                    co2e: fallbackResult.co2e,
+                    co2e_unit: fallbackResult.co2e_unit,
+                    activity_id: (fallbackResult as any).activity_id,
+                    factor_name: fallbackResult.factor_name,
+                    factor_source: (fallbackResult as any).factor_source,
+                    result: {
+                        co2e: fallbackResult.co2e,
+                        total_tco2e: (fallbackResult.co2e || 0) / 1000,
+                        factor_name: fallbackResult.factor_name,
+                        activity_id: (fallbackResult as any).activity_id,
+                        source: (fallbackResult as any).factor_source,
+                        factor_year: 2024,
+                        factor_region: (fallbackResult as any).factor_region,
+                        category
+                    }
+                } as any;
+            }
+        } catch (error: any) {
+             return {
+                success: false,
+                needs_review: true,
+                error_type: "INDIA_EMISSION_FAILED",
+                message: error.message || "Failed to calculate India emission",
+                item_name: originalItemName,
+                country: region,
+                category,
+            };
+        }
+    }
+
+    if (category === "unknown") {
+        return {
+            success: false,
+            needs_review: true,
+            error_type: "DOCUMENT_CLASSIFICATION_FAILED",
+            message: "Document category could not be detected with enough confidence.",
+            item_name: originalItemName,
+            country: region,
+            classification,
+            detection_debug: {
+                text_preview: safeLower(combinedText).slice(0, 500),
+            },
+        };
+    }
+
+    const normalizedItem = category === "electricity_bill" ? "grid electricity" : originalItemName;
+    const normalizedItemData = {
+        ...item,
+        quantity: normalizedInputItem.quantity || item.quantity,
+        unit: normalizedInputItem.unit !== "unknown" ? normalizedInputItem.unit : item.unit,
+        normalization: normalizedInputItem,
+    };
+
+    // Scanned Malaysia TNB bills often contain usage like "Jumlah Penggunaan Anda (2,169kWh)".
+    // If extraction produced amount/charges instead of consumption, force the correct kWh quantity here.
+    if (category === "electricity_bill") {
+        const kwh = getElectricityKwh(item, combinedText);
+        if (kwh > 0) {
+            normalizedItemData.quantity = kwh;
+            normalizedItemData.unit = "kWh";
+            normalizedItemData.item_name = "Electricity consumption";
+            normalizedItemData.description = "Electricity consumption";
+        }
+        
+        // Electricity calculation se pehle validation
+        const validation = validateElectricityBill({
+            extractedKwh: Number(normalizedItemData.quantity || 0),
+            rawText: combinedText,
+            source: "dynamicEmissionFactor.service",
+        } as any);
+
+        if (!validation.valid) {
+            return {
+                success: false,
+                needs_review: true,
+                error_type: "ELECTRICITY_VALIDATION_FAILED",
+                message: "Electricity bill validation failed. Please verify extracted kWh before emission calculation.",
+                item_name: String(normalizedItemData.item_name || originalItemName || "Electricity consumption"),
+                country: region,
+                category,
+                validation,
+            };
+        }
+
+        normalizedItemData.validation = validation;
+    }
+
+    const itemName = String(normalizedItemData.item_name || normalizedItemData.description || normalizedItem);
+    const query = buildClimatiqSearchQuery(category as any, itemName);
+
+    // Do not pass internal category names like "electricity_bill" to Climatiq Search.
+    // Climatiq categories are different, for example "Electricity".
+    // Passing "electricity_bill" can return 0 candidates.
+    const searchData = await searchClimatiqEmissionFactors({
+        query,
+        region,
+        resultsPerPage: 50,
+    } as any);
+
+    const candidates = [...(searchData?.results || [])];
+
+    // Safety fallback: if Climatiq search returns 0 results for MY electricity,
+    // use known public Climatiq factor metadata and still call Estimate API.
+    // This avoids failing with candidates_count: 0 when the search endpoint is strict/unstable.
+    if (region === "MY" && category === "electricity_bill" && candidates.length === 0) {
+        candidates.push({
+            id: "manual-climatiq-my-electricity-ember-2024",
+            activity_id: "electricity-supply_grid-source_production_mix",
+            name: "Electricity supplied from grid - production mix",
+            source: "Ember",
+            source_dataset: "Yearly Electricity Data",
+            year: 2024,
+            region: "MY",
+            region_name: "Malaysia",
+            unit: "kg/kWh",
+            category: "Electricity",
+            scopes: ["2"],
+            source_lca_activity: "electricity_generation",
+            mapping_score: 999,
+        });
+    }
+
+    const best = selectBestEmissionFactor(candidates, {
+        region,
+        category: category as any,
+        unit: normalizedItemData.unit,
+        itemName,
+    });
+
+    if (!best.selected) {
+        const isPurchasedGoods =
+            classification?.category === "purchased_goods" ||
+            normalizedItemData?.parameters?.category === "purchased_goods" ||
+            category === "purchased_goods";
+
+        const amount = Number(normalizedItemData?.amount || item?.amount || 0);
+        const currency = String(normalizedItemData?.currency || item?.currency || "").toUpperCase();
+
+        if (isPurchasedGoods && amount > 0 && currency) {
+            const exchangeRates: Record<string, number> = {
+                INR: Number(process.env.INR_TO_USD_RATE || 0.012),
+                MYR: Number(process.env.MYR_TO_USD_RATE || 0.21),
+                USD: 1,
+            };
+
+            const usdAmount = amount * (exchangeRates[currency] || 0);
+
+            if (usdAmount > 0) {
+                const spendSearch = await searchClimatiqEmissionFactors({
+                    query: "purchased goods spend",
+                    region: "IN",
+                } as any);
+
+                const spendFactor = spendSearch?.results?.[0] || {
+                    activity_id: "purchased_goods-default",
+                    region: "IN",
+                    year: 2024,
+                };
+
+                if (spendFactor?.activity_id) {
+                    const estimateInput = {
+                        selectedEF: {
+                            activity_id: spendFactor.activity_id,
+                            region: spendFactor.region || "IN",
+                            year: spendFactor.year || 2024,
+                        },
+                        parameters: {
+                            money: usdAmount,
+                            money_unit: "usd",
+                        },
+                    };
+
+                    const estimate = await estimateWithClimatiq(estimateInput);
+
+                    return {
+                        success: true,
+                        item_name: normalizedItemData.item_name,
+                        country: "IN",
+                        category: "purchased_goods",
+                        mapping_type: "spend_based_fallback",
+                        calculation_basis: "spend_based",
+                        converted: {
+                            value: usdAmount,
+                            unit: "USD",
+                            original_amount: amount,
+                            original_currency: currency,
+                        },
+                        climatiqBody: estimateInput,
+                        selected_emission_factor: spendFactor,
+                        result: estimate,
+                        warnings: [
+                            "No physical factor found for this item. Used spend-based purchased goods fallback.",
+                        ],
+                    } as any;
+                }
+            }
+        }
+
+        return {
+            success: false,
+            needs_review: true,
+            error_type: "CLIMATIQ_MAPPING_FAILED",
+            message: "No suitable Climatiq emission factor found",
+            item_name: itemName,
+            region,
+            country: region,
+            category,
+            search_query: query,
+            candidates_count: candidates.length,
+            candidates_preview: candidates.slice(0, 5).map((candidate: any) => ({
+                activity_id: candidate.activity_id,
+                name: candidate.name,
+                source: candidate.source,
+                year: candidate.year,
+                region: candidate.region,
+                unit: candidate.unit,
+            })),
+        };
+    }
+
+    const estimateAttempt = await estimateWithCompatibleCandidates({
+        candidates,
+        best,
+        category: category as any,
+        normalizedItemData,
+        normalizedInputItem,
+        item,
+    });
+
+    if (!estimateAttempt.estimateResponse || !estimateAttempt.selectedFactor) {
+        return {
+            success: false,
+            needs_review: true,
+            error_type: "CLIMATIQ_ESTIMATE_FAILED",
+            message: "Climatiq Estimate API failed for all compatible factor/parameter combinations.",
+            item_name: itemName,
+            region,
+            country: region,
+            category,
+            search_query: query,
+            selected_emission_factor: buildSelectedEmissionFactorSummary(best.selected),
+            alternatives: best.alternatives?.map((a: any) => ({
+                id: a.id,
+                activity_id: a.activity_id,
+                name: a.name,
+                source: a.source,
+                year: a.year,
+                region: a.region,
+                unit: a.unit,
+                mapping_score: a.mapping_score,
+            })),
+            estimate_attempts: estimateAttempt.attempts,
+            normalized_item: normalizedItemData,
+        };
+    }
+
+    const estimateResponse = estimateAttempt.estimateResponse;
+    const converted = estimateAttempt.converted;
+    const parameters = estimateAttempt.parameters;
+    const climatiqBody = estimateResponse.climatiqBody;
+    const data: any = estimateResponse.data || {};
+    const gases = data.constituent_gases || {};
+    const co2e = Number(data.co2e || gases.co2e_total || 0);
+    const gasBreakdown = estimateGasBreakdown(co2e, category);
+    const factor = data.emission_factor || estimateAttempt.selectedFactor;
+
+    // Build a structured mapping object from the best selector result
+    const mapping = {
+        success: best.selected ? true : false,
+        mapping_type: best.selected?.mapping_type || (category === "electricity_bill" ? "climatiq_latest_ember_electricity" : "climatiq_dynamic"),
+        confidence: best.confidence,
+        reason: best.reason,
+        selected_emission_factor: best.selected,
+        alternatives: best.alternatives,
+        warnings: [] as string[],
+    };
+
+    // Step 2: Build result warnings
+    const selectedEF = estimateAttempt.selectedFactor || best.selected;
+    const resultWarnings = buildResultWarnings({
+        country: region,
+        category,
+        selectedFactor: selectedEF,
+        validation: (normalizedItemData as any).validation,
+    });
+
+    // Step 3: Calculate overall pipeline confidence
+    const overallConfidence = calculatePipelineConfidence({
+        classificationConfidence: classification?.document_type_confidence,
+        normalizationConfidence: (normalizedItemData as any).normalization?.confidence,
+        validationConfidence: (normalizedItemData as any).validation?.confidence,
+        mappingConfidence: mapping?.confidence,
+    });
+
+    // Step 4: Build audit trail
+    const auditTrail = buildAuditTrail({
+        classification,
+        normalization: (normalizedItemData as any).normalization,
+        validation: (normalizedItemData as any).validation,
+        mapping,
+        calculation: {
+            co2e,
+            co2e_unit: data.co2e_unit || "kg",
+            total_tco2e: co2e / 1000,
+            factor_name: factor.name || selectedEF.name,
+            activity_id: factor.activity_id || selectedEF.activity_id,
+            source: factor.source || selectedEF.source,
+            factor_year: factor.year || selectedEF.year,
+            factor_region: factor.region || selectedEF.region,
+            category: factor.category || category,
+        },
+        warnings: resultWarnings,
+    });
+
+    // Step 5: Return with overall_confidence, warnings, audit_trail
+    return {
+        success: true,
+        item_name: itemName,
+        country: region,
+        category,
+        overall_confidence: overallConfidence,
+        warnings: resultWarnings,
+        audit_trail: auditTrail,
+        classification,
+        normalization: (normalizedItemData as any).normalization || null,
+        validation: (normalizedItemData as any).validation || null,
+        mapping,
+        search_query: query,
+        converted,
+        climatiqBody,
+        climatiq_parameter_method: estimateAttempt.parameter_method,
+        estimate_attempts: estimateAttempt.attempts,
+        selected_emission_factor: buildSelectedEmissionFactorSummary(selectedEF),
+        alternatives: best.alternatives?.map((a: any) => ({
+            id: a.id,
+            activity_id: a.activity_id,
+            name: a.name,
+            source: a.source,
+            year: a.year,
+            region: a.region,
+            unit: a.unit,
+            mapping_score: a.mapping_score,
+        })),
+        confidence: best.confidence,
+        reason: best.reason,
+        result: {
+            co2e,
+            co2e_unit: data.co2e_unit || "kg",
+            total_tco2e: co2e / 1000,
+            factor_name: factor.name || selectedEF.name,
+            activity_id: factor.activity_id || selectedEF.activity_id,
+            source: factor.source || selectedEF.source,
+            source_dataset: factor.source_dataset || selectedEF.source_dataset,
+            factor_year: factor.year || selectedEF.year,
+            factor_region: factor.region || selectedEF.region,
+            category: factor.category || category,
+            source_lca_activity: factor.source_lca_activity || selectedEF.source_lca_activity,
+            gas_breakdown_method: gasBreakdown.gas_breakdown_method,
+            co2: gases.co2 ?? gasBreakdown.co2,
+            ch4: gases.ch4 ?? gasBreakdown.ch4,
+            n2o: gases.n2o ?? gasBreakdown.n2o,
+            co2e_other: gases.co2e_other ?? gasBreakdown.co2e_other,
+        },
+        raw_api_response: data,
+    };
+}

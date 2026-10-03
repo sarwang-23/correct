@@ -1,0 +1,387 @@
+export type NormalizedUnit =
+    | "kWh"
+    | "kg"
+    | "t"
+    | "l"
+    | "m3"
+    | "m2"
+    | "km"
+    | "passenger-km"
+    | "number"
+    | "unknown";
+
+export interface NormalizedLineItem {
+    item_name: string;
+    description?: string;
+    original_quantity: any;
+    original_unit: any;
+    quantity: number;
+    unit: NormalizedUnit;
+    amount?: number | null;
+    currency?: string | null;
+    confidence?: number;
+    source?: string;
+    parameters?: Record<string, any>;
+    warnings: string[];
+    audit: {
+        normalization_method: string;
+        original_unit: any;
+        normalized_unit: NormalizedUnit;
+        original_quantity: any;
+        normalized_quantity: number;
+    };
+}
+
+function toNumber(value: any): number {
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : 0;
+    }
+
+    const cleaned = String(value ?? "")
+        .replace(/,/g, "")
+        .replace(/[^\d.-]/g, "")
+        .trim();
+
+    const num = Number(cleaned);
+    return Number.isFinite(num) ? num : 0;
+}
+
+function safeLower(value: any): string {
+    return String(value || "").toLowerCase().trim();
+}
+
+function roundNumber(value: number, decimals = 6): number {
+    return Number(Number(value || 0).toFixed(decimals));
+}
+
+export function normalizeUnit(unit: any, itemName = "", description = ""): NormalizedUnit {
+    const unitText = safeLower(unit)
+        .replace(/\./g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const text = safeLower(`${unit || ""} ${itemName || ""} ${description || ""}`)
+        .replace(/\./g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    if (!text) return "unknown";
+
+    if (
+        text.includes("kwh") ||
+        text.includes("kw h") ||
+        text.includes("kw/h") ||
+        text.includes("kilowatt")
+    ) {
+        return "kWh";
+    }
+
+    if (
+        unitText === "kg" ||
+        unitText === "kgs" ||
+        text.includes(" kg") ||
+        text.includes("kgs") ||
+        text.includes("kilogram") ||
+        text.includes("kilograms")
+    ) {
+        return "kg";
+    }
+
+    if (
+        unitText === "t" ||
+        unitText === "mt" ||
+        text.includes(" mt") ||
+        text.includes("tonne") ||
+        text.includes("tonnes") ||
+        text.includes("metric ton") ||
+        text.includes("metric tonne")
+    ) {
+        return "t";
+    }
+
+    if (
+        unitText === "l" ||
+        unitText === "ltr" ||
+        text.includes(" ltr") ||
+        text.includes(" litre") ||
+        text.includes(" liter") ||
+        text.includes(" litres") ||
+        text.includes(" liters")
+    ) {
+        return "l";
+    }
+
+    if (
+        text.includes("m3") ||
+        text.includes("m³") ||
+        text.includes("cbm") ||
+        text.includes("cubic meter") ||
+        text.includes("cubic metre")
+    ) {
+        return "m3";
+    }
+
+    // Square meter / area units used in timber, plywood, laminate, flush-door invoices.
+    // Examples from OCR/Mistral: m2, m², Sq.Mr., Sq.Mtr., Sq.M, sqm.
+    if (
+        unitText === "m2" ||
+        unitText === "m²" ||
+        unitText === "sqm" ||
+        unitText === "sq m" ||
+        unitText === "sqmr" ||
+        unitText === "sq mr" ||
+        unitText === "sqmtr" ||
+        unitText === "sq mtr" ||
+        unitText === "sqmeter" ||
+        unitText === "sq meter" ||
+        unitText === "sqmetre" ||
+        unitText === "sq metre" ||
+        text.includes(" m2") ||
+        text.includes("m²") ||
+        text.includes("sqm") ||
+        text.includes("sq m") ||
+        text.includes("sqmr") ||
+        text.includes("sq mr") ||
+        text.includes("sqmtr") ||
+        text.includes("sq mtr") ||
+        text.includes("square meter") ||
+        text.includes("square metre") ||
+        text.includes("square meters") ||
+        text.includes("square metres")
+    ) {
+        return "m2";
+    }
+
+    if (
+        unitText === "km" ||
+        text.includes(" km") ||
+        text.includes("kilometer") ||
+        text.includes("kilometre")
+    ) {
+        return "km";
+    }
+
+    if (
+        text.includes("passenger-km") ||
+        text.includes("passenger km") ||
+        text.includes("passenger kilometer") ||
+        text.includes("passenger kilometre") ||
+        text.includes("pkm")
+    ) {
+        return "passenger-km";
+    }
+
+    if (
+        text.includes("room night") ||
+        text.includes("night") ||
+        text.includes("number") ||
+        text.includes("pcs") ||
+        text.includes("piece") ||
+        text.includes("pieces") ||
+        text.includes("nos") ||
+        text.includes("unit")
+    ) {
+        return "number";
+    }
+
+    return "unknown";
+}
+
+export function convertToBaseQuantity(quantity: any, unit: NormalizedUnit) {
+    const value = toNumber(quantity);
+    const warnings: string[] = [];
+
+    if (!value || value <= 0) {
+        warnings.push("Quantity is missing or invalid.");
+        return {
+            value: 0,
+            unit,
+            warnings,
+        };
+    }
+
+    if (unit === "t") {
+        return {
+            value: roundNumber(value * 1000),
+            unit: "kg" as NormalizedUnit,
+            warnings,
+        };
+    }
+
+    return {
+        value: roundNumber(value),
+        unit,
+        warnings,
+    };
+}
+
+export function normalizeCurrency(value: any): string | null {
+    const text = safeLower(value);
+
+    if (text.includes("myr") || text.includes("rm")) return "MYR";
+    if (text.includes("inr") || text.includes("₹") || text.includes("rs")) return "INR";
+    if (text.includes("usd") || text.includes("$")) return "USD";
+    if (text.includes("gbp") || text.includes("£")) return "GBP";
+    if (text.includes("eur") || text.includes("€")) return "EUR";
+
+    return value ? String(value).toUpperCase() : null;
+}
+
+export function cleanItemName(rawName: string, vendor?: string): string {
+    let name = String(rawName || "").replace(/\s+/g, " ").trim();
+    if (!name) return "Unknown item";
+
+    // 1. Remove Dates (e.g. 11/06/17, 12-05-2017)
+    name = name.replace(/\b\d{1,4}[/-]\d{1,2}[/-]\d{1,4}\b/g, " ");
+
+    // 2. Remove Measurements & Dimensions
+    name = name.replace(/\b(?:size\s*:?\s*)?\d+(?:\.\d+)?\s*(?:mm|cm|inch|mtr|m|ft|sqm|sq mtr)\b/gi, " ");
+    name = name.replace(/\b\d+(?:\.\d+)?\s*[xX*]\s*\d+(?:\.\d+)?(?:\s*[xX*]\s*\d+(?:\.\d+)?)?\b/g, " ");
+    name = name.replace(/\b(?:size\s*)\b/gi, " ");
+
+    // 3. Remove Garbage Tokens
+    const garbageTokens = /\b(paying|rate|gst|cgst|sgst|igst|tax|discount|total|amount|po|inv|no\.?|ref)\b/gi;
+    name = name.replace(garbageTokens, " ");
+
+    // 4. Remove Random Codes / Invoice Numbers (like 38/1129, HE/24, SB17Y, F3011-011)
+    name = name.replace(/\b[A-Z0-9]+[/-][A-Z0-9]+\b/gi, " ");
+
+    // Clean up multiple spaces
+    name = name.replace(/\s+/g, " ").trim();
+
+    // 5. Vendor Based Intelligence & Industry Dictionary
+    const v = String(vendor || "").toLowerCase();
+    const n = name.toLowerCase();
+
+    // Timber intelligence
+    if (v.includes("timber") || v.includes("wood") || v.includes("ply")) {
+        if (!/\b(plywood|door|board|timber|wood|mdf|veneer|laminate)\b/.test(n)) {
+            return name.length < 3 ? "Plywood" : "Plywood"; // Default
+        }
+    }
+
+    // Steel intelligence
+    if (v.includes("steel") || v.includes("iron") || v.includes("metal")) {
+        if (!/\b(tmt|bar|rod|coil|pipe|beam|angle|channel|scrap)\b/.test(n)) {
+             return name.length < 3 ? "TMT Bar" : "TMT Bar"; // Default
+        }
+    }
+
+    // Industry Dictionary / Similar matching
+    if (/\b(?:tmt|ms|ss|gi|bars?|rods?|coils?|pipes?|beams?|angles?|channels?)\b/.test(n) && !n.includes("steel") && !n.includes("iron")) {
+        if (n.includes("tmt")) return "MS TMT Bar";
+    }
+
+    if (/\b(door|door shutter|flush door|plywood|blockboard|mdf|board|wood|timber)\b/.test(n)) {
+        if (n.includes("door shutter")) return "Door Shutter";
+        if (n.includes("flush door")) return "Flush Door";
+        if (n.includes("plywood")) return "Commercial Plywood";
+        if (n.includes("mdf")) return "MDF Board";
+    }
+
+    if (n === "m s tmt bars") return "MS TMT Bars";
+    if (n.includes("tmt bars 12 mm")) return "MS TMT Bars";
+
+    return name || "Unknown item";
+}
+
+export function normalizeLineItem(item: any): NormalizedLineItem {
+    const rawItemName = String(item?.item_name || item?.name || item?.description || "Unknown item");
+    const itemName = cleanItemName(rawItemName, item?.vendor || item?.parameters?.vendor);
+    const description = String(item?.description || item?.item_description || "");
+    const unitLower = String(item?.unit || item?.uom || "").toLowerCase().trim();
+
+    if (["m2", "sqm", "sq.mtr", "sq.mr", "sq.mt"].includes(unitLower)) {
+        return {
+            ...item,
+            item_name: itemName,
+            description,
+            original_quantity: item.quantity,
+            original_unit: item.unit,
+            quantity: Number(item.quantity || 0),
+            unit: "m2",
+            parameters: {
+                ...(item.parameters || {}),
+                normalized_quantity: Number(item.quantity || 0),
+                normalized_unit: "m2",
+                calculation_basis: "area_or_spend_based",
+            },
+            warnings: [
+                ...(item.warnings || []),
+                "Area unit m2 preserved. Do not convert m2 to kg without material density.",
+            ],
+            audit: {
+                normalization_method: "area_unit_preserved",
+                original_unit: item.unit,
+                normalized_unit: "m2",
+                original_quantity: item.quantity,
+                normalized_quantity: item.quantity,
+            },
+        };
+    }
+
+    const originalQuantity =
+        item?.quantity ??
+        item?.qty ??
+        item?.parameters?.energy ??
+        item?.parameters?.energy_kwh ??
+        item?.parameters?.weight ??
+        item?.parameters?.volume ??
+        item?.parameters?.area ??
+        item?.parameters?.area_m2 ??
+        0;
+
+    const originalUnit =
+        item?.unit ??
+        item?.uom ??
+        item?.parameters?.energy_unit ??
+        item?.parameters?.weight_unit ??
+        item?.parameters?.volume_unit ??
+        item?.parameters?.area_unit ??
+        "";
+
+    const normalizedUnit = normalizeUnit(originalUnit, itemName, description);
+    const converted = convertToBaseQuantity(originalQuantity, normalizedUnit);
+
+    const warnings = [...converted.warnings];
+
+    if (normalizedUnit === "unknown") {
+        warnings.push(`Unit could not be normalized from value: ${originalUnit || "missing"}`);
+    }
+
+    return {
+        item_name: itemName,
+        description,
+        original_quantity: originalQuantity,
+        original_unit: originalUnit,
+        quantity: converted.value,
+        unit: converted.unit,
+        amount: item?.amount ? toNumber(item.amount) : item?.amount_myr ? toNumber(item.amount_myr) : null,
+        currency: normalizeCurrency(item?.currency || item?.parameters?.currency || ""),
+        confidence: Number(item?.confidence_score || item?.confidence || 0.75) || 0.75,
+        source: item?.source || "line_item_normalizer",
+        parameters: {
+            ...(item?.parameters || {}),
+            normalized_quantity: converted.value,
+            normalized_unit: converted.unit,
+        },
+        warnings,
+        audit: {
+            normalization_method: "unit_and_quantity_normalization",
+            original_unit: originalUnit,
+            normalized_unit: converted.unit,
+            original_quantity: originalQuantity,
+            normalized_quantity: converted.value,
+        },
+    };
+}
+
+export function normalizeLineItems(items: any[]): NormalizedLineItem[] {
+    if (!Array.isArray(items)) return [];
+    return items.map(normalizeLineItem);
+}
+
+export function hasValidNormalizedQuantity(item: NormalizedLineItem) {
+    return Boolean(item.quantity && item.quantity > 0 && item.unit !== "unknown");
+}
+
