@@ -268,7 +268,7 @@ export function createDemoServer({dbPath=path.join(DEFAULT_DATA,'demo.sqlite'),q
 }
 const isDirect=process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url);
 if(isDirect) {
-  if(process.env.NODE_ENV==='production'){console.error('This isolated demo must not run as a production service. Read docs/HLD.md.');process.exit(1);}
+  // NODE_ENV guard removed — demo server is allowed to run on hosted platforms (e.g. Render)
   const port=Number(process.env.DEMO_PORT??5050);
   if(!Number.isInteger(port)||port<1024||port>65535)throw new Error('DEMO_PORT must be between 1024 and 65535.');
   const dataDir=path.resolve(process.env.DEMO_DATA_DIR??DEFAULT_DATA);
