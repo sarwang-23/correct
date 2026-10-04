@@ -25,9 +25,13 @@ export async function tenantTx(pool, tenantId, fn) {
     let broken = false;
     try {
         await client.query('BEGIN');
-        await client.query("SELECT set_config('app.tenant_id',$1,true)", [tenantId]);
-        await client.query("SET LOCAL lock_timeout = '5s'");
-        await client.query("SET LOCAL idle_in_transaction_session_timeout = '25s'");
+        // One round trip instead of three. set_config(..., true) is exactly
+        // equivalent to SET LOCAL, and every request opens at least two
+        // transactions (authenticate + the route handler), so collapsing these
+        // removes four network round trips per request.
+        await client.query(`SELECT set_config('app.tenant_id',$1,true),
+            set_config('lock_timeout','5s',true),
+            set_config('idle_in_transaction_session_timeout','25s',true)`, [tenantId]);
         const result = await fn(client);
         await client.query('COMMIT');
         return result;

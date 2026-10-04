@@ -1,12 +1,39 @@
 import { hash, uuid, text, fail, passwordVerify, passwordHash, sessionToken, parseToken } from './core.mjs';
 import { tenantTx, audit, enqueue } from './db.mjs';
 const DUMMY = 'scrypt$' + '0'.repeat(32) + '$' + '0'.repeat(128);
+/**
+ * Increments every supplied bucket in ONE round trip.
+ *
+ * cs.rate_buckets is deliberately outside the RLS table list (it is keyed by a
+ * hash of the caller, not by tenant_id), so a batched upsert is safe to run
+ * outside a tenant transaction. Every authenticated request needs two buckets
+ * (per-user and per-tenant), and the previous per-bucket INSERT cost one
+ * network round trip each.
+ *
+ * `unnest` keeps this to a single statement while preserving the original
+ * semantics exactly: a lapsed window resets to 1 and takes the fresh
+ * expires_at (EXCLUDED), an open window only increments hits and keeps its
+ * deadline.
+ */
+export async function rateLimitMany(pool, entries) {
+    if (!entries.length)
+        return;
+    const keys = entries.map(e => hash(e.key));
+    const seconds = entries.map(e => e.seconds);
+    const rows = (await pool.query(`INSERT INTO cs.rate_buckets(bucket_key,hits,expires_at)
+      SELECT k,1,now()+s*interval '1 second' FROM unnest($1::text[],$2::int[]) AS t(k,s)
+      ON CONFLICT(bucket_key) DO UPDATE SET
+        hits=CASE WHEN cs.rate_buckets.expires_at<=now() THEN 1 ELSE cs.rate_buckets.hits+1 END,
+        expires_at=CASE WHEN cs.rate_buckets.expires_at<=now() THEN EXCLUDED.expires_at ELSE cs.rate_buckets.expires_at END
+      RETURNING bucket_key,hits`, [keys, seconds])).rows;
+    const hitsByKey = new Map(rows.map(r => [r.bucket_key, r.hits]));
+    for (const [i, e] of entries.entries()) {
+        if (hitsByKey.get(keys[i]) > e.max)
+            fail(429, 'RATE_LIMITED', 'Too many requests. Retry after the rate window.');
+    }
+}
 export async function rateLimit(pool, key, max, seconds) {
-    const r = (await pool.query(`INSERT INTO cs.rate_buckets(bucket_key,hits,expires_at) VALUES($1,1,now()+$2*interval '1 second')
-    ON CONFLICT(bucket_key) DO UPDATE SET hits=CASE WHEN cs.rate_buckets.expires_at<=now() THEN 1 ELSE cs.rate_buckets.hits+1 END,
-    expires_at=CASE WHEN cs.rate_buckets.expires_at<=now() THEN now()+$2*interval '1 second' ELSE cs.rate_buckets.expires_at END RETURNING hits`, [hash(key), seconds])).rows[0];
-    if (r.hits > max)
-        fail(429, 'RATE_LIMITED', 'Too many requests. Retry after the rate window.');
+    await rateLimitMany(pool, [{ key, max, seconds }]);
 }
 export async function login(pool, body, ip, sessionHours = 8) {
     await rateLimit(pool, 'login-ip:' + ip, 30, 900);
